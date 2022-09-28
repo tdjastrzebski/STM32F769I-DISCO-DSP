@@ -19,6 +19,9 @@
 #define SCREEN_HEIGHT OTM8009A_800X480_HEIGHT
 #define DRAW_BUFFER_SIZE (SCREEN_WIDTH * SCREEN_HEIGHT / 10)
 #define LCD_BPP 4  // bytes per pixel
+#define AUDIO_OUT_BUFFER_SIZE 8192
+#define AUDIO_IN_PCM_BUFFER_SIZE 4 * 2304 /* buffer size in half-word */
+#define SCRATCH_BUFF_SIZE 512
 
 extern UART_HandleTypeDef huart1;
 extern DMA2D_HandleTypeDef hdma2d;
@@ -29,6 +32,56 @@ LV_FONT_DECLARE(lv_font_montserrat_16)
 static lv_disp_drv_t _disp_drv;                                    // lvgl display driver
 ALIGN_32BYTES(static lv_color_t _lvDrawBuffer[DRAW_BUFFER_SIZE]);  // declare a buffer of 1/10 screen size
 int16_t PlayBuff[4096];
+int32_t Scratch[SCRATCH_BUFF_SIZE];
+
+typedef enum {
+	BUFFER_OFFSET_NONE = 0,
+	BUFFER_OFFSET_HALF,
+	BUFFER_OFFSET_FULL,
+} BUFFER_StateTypeDef;
+
+typedef enum {
+	BUFFER_EMPTY = 0,
+	BUFFER_FULL,
+} WR_BUFFER_StateTypeDef;
+
+typedef struct {
+	uint8_t buff[AUDIO_OUT_BUFFER_SIZE];
+	BUFFER_StateTypeDef state;
+	uint32_t fptr;
+} AUDIO_OUT_BufferTypeDef;
+
+typedef struct {
+	uint16_t pcm_buff[AUDIO_IN_PCM_BUFFER_SIZE];
+	uint32_t pcm_ptr;
+	WR_BUFFER_StateTypeDef wr_state;
+	uint32_t offset;
+	uint32_t fptr;
+} AUDIO_IN_BufferTypeDef;
+
+typedef enum {
+	AUDIO_STATE_IDLE = 0,
+	AUDIO_STATE_WAIT,
+	AUDIO_STATE_INIT,
+	AUDIO_STATE_PLAY,
+	AUDIO_STATE_PRERECORD,
+	AUDIO_STATE_RECORD,
+	AUDIO_STATE_NEXT,
+	AUDIO_STATE_PREVIOUS,
+	AUDIO_STATE_FORWARD,
+	AUDIO_STATE_BACKWARD,
+	AUDIO_STATE_STOP,
+	AUDIO_STATE_PAUSE,
+	AUDIO_STATE_RESUME,
+	AUDIO_STATE_VOLUME_UP,
+	AUDIO_STATE_VOLUME_DOWN,
+	AUDIO_STATE_ERROR,
+} AUDIO_PLAYBACK_StateTypeDef;
+
+AUDIO_PLAYBACK_StateTypeDef AudioState;
+
+ALIGN_32BYTES(static AUDIO_OUT_BufferTypeDef BufferCtlOut);
+ALIGN_32BYTES(static AUDIO_IN_BufferTypeDef BufferCtlIn);
 
 static void LogInfo(const char* format_msg, ...);
 static void FlushBufferStart(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t* color_p);
@@ -37,6 +90,7 @@ static void LvglRefresh(TIM_HandleTypeDef* htim);
 static void HelloWorld(void);
 static void LvglInit(void);
 static void TouchapadRead(lv_indev_drv_t* drv, lv_indev_data_t* data);
+static __IO uint32_t uwVolume = 70;
 
 extern "C" void PreInit() {}
 
@@ -51,7 +105,32 @@ extern "C" void PostInit(void) {
 	BSP_TS_Init(800, 472);
 
 	LvglInit();
-	wm8994_Init(AUDIO_I2C_ADDRESS, OUTPUT_DEVICE_HEADPHONE, 100, AUDIO_FREQUENCY_44K);
+
+	// wm8994_Init(AUDIO_I2C_ADDRESS, OUTPUT_DEVICE_HEADPHONE, 100, AUDIO_FREQUENCY_44K);
+	uint32_t sampleRate = 128;
+	BSP_AUDIO_OUT_Init(OUTPUT_DEVICE_BOTH, uwVolume, sampleRate);
+
+	// **PLAY**
+	// fill in the buffer
+	SCB_CleanDCache_by_Addr((uint32_t*)&BufferCtlOut.buff[0], AUDIO_OUT_BUFFER_SIZE);
+	BufferCtlOut.state = BUFFER_OFFSET_NONE;
+	// stream out
+	BSP_AUDIO_OUT_Play((uint16_t*)&BufferCtlOut.buff[0], AUDIO_OUT_BUFFER_SIZE);
+	// BufferCtl.fptr = bytesread;
+	BufferCtlOut.fptr += AUDIO_OUT_BUFFER_SIZE;
+	// stop
+	BSP_AUDIO_OUT_Stop(CODEC_PDWN_SW);
+
+	// **RECORD**
+	BSP_AUDIO_IN_Init(BSP_AUDIO_FREQUENCY_16K, DEFAULT_AUDIO_IN_BIT_RESOLUTION, DEFAULT_AUDIO_IN_CHANNEL_NBR);
+	BSP_AUDIO_IN_AllocScratch(Scratch, SCRATCH_BUFF_SIZE);
+	BSP_AUDIO_IN_Record((uint16_t*)&BufferCtlIn.pcm_buff[0], AUDIO_IN_PCM_BUFFER_SIZE);
+	// BufferCtl.fptr = byteswritten;
+	BufferCtlIn.fptr = AUDIO_IN_PCM_BUFFER_SIZE;
+	BufferCtlIn.pcm_ptr = 0;
+	BufferCtlIn.offset = 0;
+	BufferCtlIn.wr_state = BUFFER_EMPTY;
+	BSP_AUDIO_IN_Stop();
 
 	HelloWorld();
 
@@ -62,6 +141,50 @@ extern "C" void PostInit(void) {
 	htim14.PeriodElapsedCallback = LvglRefresh;
 	// start LVGL timer 5ms
 	HAL_TIM_Base_Start_IT(&htim14);  // Note: this interrupt must have "Preemption Priority" higher than DMA2D interrupt. Lower "Preemption Priority" (DMA2D) is served FIRST and uninterrupted.
+}
+
+//  Calculates the remaining file size and new position of the pointer.
+void BSP_AUDIO_IN_TransferComplete_CallBack(void) {
+	BufferCtlIn.pcm_ptr += AUDIO_IN_PCM_BUFFER_SIZE / 2;
+	if (BufferCtlIn.pcm_ptr == AUDIO_IN_PCM_BUFFER_SIZE / 2) {
+		BufferCtlIn.wr_state = BUFFER_FULL;
+		BufferCtlIn.offset = 0;
+	}
+
+	if (BufferCtlIn.pcm_ptr >= AUDIO_IN_PCM_BUFFER_SIZE) {
+		BufferCtlIn.wr_state = BUFFER_FULL;
+		BufferCtlIn.offset = AUDIO_IN_PCM_BUFFER_SIZE / 2;
+		BufferCtlIn.pcm_ptr = 0;
+	}
+}
+
+// Manages the DMA Half Transfer complete interrupt.
+void BSP_AUDIO_IN_HalfTransfer_CallBack(void) {
+	BufferCtlIn.pcm_ptr += AUDIO_IN_PCM_BUFFER_SIZE / 2;
+	if (BufferCtlIn.pcm_ptr == AUDIO_IN_PCM_BUFFER_SIZE / 2) {
+		BufferCtlIn.wr_state = BUFFER_FULL;
+		BufferCtlIn.offset = 0;
+	}
+
+	if (BufferCtlIn.pcm_ptr >= AUDIO_IN_PCM_BUFFER_SIZE) {
+		BufferCtlIn.wr_state = BUFFER_FULL;
+		BufferCtlIn.offset = AUDIO_IN_PCM_BUFFER_SIZE / 2;
+		BufferCtlIn.pcm_ptr = 0;
+	}
+}
+
+// Calculates the remaining file size and new position of the pointer.
+void BSP_AUDIO_OUT_TransferComplete_CallBack(void) {
+	if (AudioState == AUDIO_STATE_PLAY) {
+		BufferCtlOut.state = BUFFER_OFFSET_FULL;
+	}
+}
+
+// Manages the DMA Half Transfer complete interrupt.
+void BSP_AUDIO_OUT_HalfTransfer_CallBack(void) {
+	if (AudioState == AUDIO_STATE_PLAY) {
+		BufferCtlOut.state = BUFFER_OFFSET_HALF;
+	}
 }
 
 extern "C" void MainLoop(void) {
