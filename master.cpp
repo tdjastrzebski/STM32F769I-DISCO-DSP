@@ -7,13 +7,13 @@
 #include <cstdarg>
 #include <cstdio>
 
+#include "arm_math.h"
 #include "lvgl.h"
 #include "main.h"
 #include "stm32f769i_discovery_audio.h"
 #include "stm32f769i_discovery_lcd.h"
 #include "stm32f769i_discovery_ts.h"
 #include "stm32f7xx_hal.h"
-#include "arm_math.h"
 
 #define SCREEN_WIDTH OTM8009A_800X480_WIDTH
 #define SCREEN_HEIGHT OTM8009A_800X480_HEIGHT
